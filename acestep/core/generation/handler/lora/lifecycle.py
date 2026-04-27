@@ -400,7 +400,10 @@ def remove_lora(self, adapter_name: str) -> str:
             if hasattr(self, "_memory_allocated"):
                 mem_before = self._memory_allocated() / (1024**3)
                 logger.info(f"VRAM before LoRA unload: {mem_before:.2f}GB")
-            self.model.decoder = decoder.get_base_model()
+            # FIX: same as unload_lora() — use unload() instead of get_base_model().
+            # get_base_model() leaves wrapped LoraLinear modules in place; unload()
+            # restores the original Linear modules and frees their LoRA weights.
+            self.model.decoder = decoder.unload()
             load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
@@ -477,13 +480,36 @@ def unload_lora(self) -> str:
             PeftModel = None  # type: ignore[assignment]
 
         if PeftModel is not None and isinstance(self.model.decoder, PeftModel):
-            logger.info("Extracting base model from PEFT wrapper")
-            self.model.decoder = self.model.decoder.get_base_model()
+            logger.info("Unloading PEFT wrapper (removes LoRA modules from decoder)")
+            # FIX: get_base_model() only returns the inner model but leaves LoRA-
+            # wrapped modules (LoraLinear) in place. We must call unload() which
+            # restores the original Linear modules in their place.
+            self.model.decoder = self.model.decoder.unload()
+            # After unload(), the decoder should be the base model with original
+            # Linear modules restored. The state_dict should now match.
             load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
+            # DIAG2 — à retirer après debug
+            logger.info(f"DIAG2: missing keys total: {len(load_result.missing_keys)}")
+            logger.info(f"DIAG2: unexpected keys total: {len(load_result.unexpected_keys)}")
+            try:
+                params = dict(self.model.decoder.named_parameters())
+                first_layer = params.get('layers.0.self_attn.q_proj.weight')
+                if first_layer is not None:
+                    logger.info(f"DIAG2: q_proj.weight current norm: {first_layer.norm().item():.6f}")
+                    saved = self._base_decoder.get('layers.0.self_attn.q_proj.weight')
+                    if saved is not None:
+                        saved_norm = saved.float().norm().item()
+                        logger.info(f"DIAG2: q_proj.weight backup norm: {saved_norm:.6f}")
+                        diff = (first_layer.cpu().float() - saved.float()).abs().max().item()
+                        logger.info(f"DIAG2: max diff with backup: {diff:.6e}")
+            except Exception as e:
+                logger.warning(f"DIAG2: param check failed: {e}")
+            # FIN DIAG2                
+                
         else:
             logger.info("Restoring base decoder from state_dict backup")
             load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
@@ -494,7 +520,34 @@ def unload_lora(self) -> str:
 
         self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
         self.model.decoder.eval()
-
+        # DIAG3 — état réel après to(device).to(dtype)
+        try:
+            params = dict(self.model.decoder.named_parameters())
+            first_layer = params.get('layers.0.self_attn.q_proj.weight')
+            if first_layer is not None:
+                logger.info(f"DIAG3: AFTER to(device,dtype) q_proj norm: {first_layer.norm().item():.6f}")
+                logger.info(f"DIAG3: AFTER dtype: {first_layer.dtype}, device: {first_layer.device}")
+                saved = self._base_decoder.get('layers.0.self_attn.q_proj.weight')
+                if saved is not None:
+                    logger.info(f"DIAG3: backup dtype: {saved.dtype}, device: {saved.device}")
+                    # Comparer avec un check robuste
+                    saved_on_device = saved.to(first_layer.device).to(first_layer.dtype)
+                    diff = (first_layer - saved_on_device).abs().max().item()
+                    logger.info(f"DIAG3: max abs diff (same device,dtype): {diff:.6e}")
+                    rel_diff = diff / saved_on_device.abs().max().item()
+                    logger.info(f"DIAG3: relative max diff: {rel_diff:.6e}")
+        except Exception as e:
+            logger.warning(f"DIAG3: failed: {e}")
+        # FIN DIAG3        
+        # DIAGNOSTIC — à retirer après debug
+        logger.info(f"DIAG: decoder type after unload: {type(self.model.decoder).__name__}")
+        logger.info(f"DIAG: decoder module: {type(self.model.decoder).__module__}")
+        lora_modules = [n for n, m in self.model.decoder.named_modules() 
+                        if hasattr(m, 'lora_A') or hasattr(m, 'lora_B') or 'lora' in type(m).__name__.lower()]
+        logger.info(f"DIAG: lora-like modules still present: {len(lora_modules)}")
+        if lora_modules:
+            logger.info(f"DIAG: first 3 lora modules: {lora_modules[:3]}")
+        # FIN DIAGNOSTIC
         self.lora_loaded = False
         self.use_lora = False
         self._adapter_type = None
